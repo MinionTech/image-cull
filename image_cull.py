@@ -1513,11 +1513,99 @@ def _self_check():
     _check_generation_profile_cull()
     _check_quality_profile_cull()
     _check_hygiene_profile_cull()
+    _check_hygiene_fixtures()
     _check_recursive_cull()
     _check_quality_score_bounds()
     _check_quality_fast_issue_validation()
     _check_heif_support()
     _check_edit_policy()
+
+
+def _hygiene_fixtures_dir() -> Path:
+    return Path(__file__).resolve().parent / "fixtures" / "hygiene"
+
+
+def _assert_hygiene_expectation(name: str, result: dict, expect: dict) -> None:
+    if result.get("action") != expect["action"]:
+        raise AssertionError(f"{name}: action {result.get('action')} != {expect['action']} ({result})")
+    if "exact_dupe_of" in expect and result.get("exact_dupe_of") != expect["exact_dupe_of"]:
+        raise AssertionError(
+            f"{name}: exact_dupe_of {result.get('exact_dupe_of')} != {expect['exact_dupe_of']}"
+        )
+    if "reason" in expect and result.get("reason") != expect["reason"]:
+        raise AssertionError(f"{name}: reason {result.get('reason')} != {expect['reason']}")
+    if prefix := expect.get("reason_prefix"):
+        reason = result.get("reason", "")
+        if not reason.startswith(prefix):
+            raise AssertionError(f"{name}: reason {reason!r} does not start with {prefix!r}")
+
+
+def _check_hygiene_fixtures() -> None:
+    import io
+    import sys
+    from contextlib import redirect_stderr, redirect_stdout
+    from unittest.mock import patch
+
+    from PIL import Image
+
+    fixtures_dir = _hygiene_fixtures_dir()
+    manifest_path = fixtures_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise AssertionError(f"missing hygiene fixtures manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+    min_res = tuple(manifest["min_res"]) if manifest.get("min_res") else None
+
+    for name, expect in manifest["files"].items():
+        path = fixtures_dir / name
+        if not path.is_file():
+            raise AssertionError(f"missing hygiene fixture: {path}")
+        use_min_res = min_res if expect.get("apply_min_res", True) else None
+        result = check_hygiene(path, dupe_of=expect.get("dupe_of"), min_res=use_min_res)
+        _assert_hygiene_expectation(name, result, expect)
+        if expect.get("transcode"):
+            send_path, temp_path = prepare_analysis_image(path, 0)
+            assert temp_path is not None and send_path.suffix.lower() == ".jpg", name
+            try:
+                with Image.open(send_path) as out:
+                    out.load()
+            finally:
+                temp_path.unlink(missing_ok=True)
+
+    dry = manifest.get("dry_run")
+    if not dry:
+        return
+
+    mod = sys.modules[__name__]
+    with tempfile.TemporaryDirectory() as tmp:
+        input_dir = Path(tmp) / "photos"
+        filter_dir = Path(tmp) / "rejects"
+        input_dir.mkdir()
+        for name in manifest["files"]:
+            shutil.copy2(fixtures_dir / name, input_dir / name)
+        args = argparse.Namespace(
+            model="llava",
+            threshold=7.0,
+            threshold_ai=None,
+            threshold_quality=None,
+            threshold_generation=None,
+            profile=dry["profile"],
+            checks=tuple(dry["checks"]),
+            dry_run=True,
+            max_dimension=0,
+            min_res=parse_min_res(dry["min_res"]),
+            fast=False,
+            report_path_display=None,
+        )
+        with patch.object(mod, "ensure_model") as mock_ensure, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            run_cull(args, input_dir, filter_dir)
+        mock_ensure.assert_not_called()
+        _, results = load_report(input_dir / DEFAULT_REPORT_NAME)
+        by_file = {r["file"]: r for r in results}
+        for name, expect in dry["expectations"].items():
+            entry = by_file.get(name)
+            if entry is None:
+                raise AssertionError(f"dry_run missing report entry for {name}")
+            _assert_hygiene_expectation(name, entry.get("hygiene", {}), expect)
 
 
 def _check_heif_support():
