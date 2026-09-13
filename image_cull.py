@@ -1582,6 +1582,15 @@ def _check_hygiene_fixtures() -> None:
         input_dir.mkdir()
         for name in manifest["files"]:
             shutil.copy2(fixtures_dir / name, input_dir / name)
+        fixture_paths = [p for p in input_dir.iterdir() if p.is_file()]
+        expected_dupe_map = manifest.get("dupe_map")
+        if expected_dupe_map is not None:
+            dupe_map = build_dupe_map(fixture_paths, input_dir)
+            if dupe_map != expected_dupe_map:
+                raise AssertionError(
+                    f"dupe_map {dupe_map} != {expected_dupe_map} "
+                    "(build_dupe_map keeps first path by sorted name)"
+                )
         args = argparse.Namespace(
             model="llava",
             threshold=7.0,
