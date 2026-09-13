@@ -1266,6 +1266,7 @@ def run_cull(args, input_dir: Path, filter_dir: Path):
 
 
 def _self_check():
+    """Run built-in deterministic assertions for CI (--self-check)."""
     assert should_reject({"file": "a.jpg", "keep": True, "analysis": {"realism_score": 1.0}}, 7.0) is False
     assert should_reject({"file": "b.jpg", "keep": False, "analysis": {"realism_score": 10.0}}, 7.0) is True
     assert should_reject({"file": "c.jpg", "analysis": {"realism_score": 6.0}}, 7.0) is True
