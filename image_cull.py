@@ -1522,10 +1522,12 @@ def _self_check():
 
 
 def _hygiene_fixtures_dir() -> Path:
+    """Return the committed hygiene fixture directory shipped with the repo."""
     return Path(__file__).resolve().parent / "fixtures" / "hygiene"
 
 
 def _assert_hygiene_expectation(name: str, result: dict, expect: dict) -> None:
+    """Raise AssertionError when a hygiene result mismatches manifest expectations."""
     if result.get("action") != expect["action"]:
         raise AssertionError(f"{name}: action {result.get('action')} != {expect['action']} ({result})")
     if "exact_dupe_of" in expect and result.get("exact_dupe_of") != expect["exact_dupe_of"]:
@@ -1541,6 +1543,7 @@ def _assert_hygiene_expectation(name: str, result: dict, expect: dict) -> None:
 
 
 def _check_hygiene_fixtures() -> None:
+    """Validate fixtures/hygiene/ against manifest.json without Ollama."""
     import io
     import sys
     from contextlib import redirect_stderr, redirect_stdout
