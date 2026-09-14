@@ -659,23 +659,33 @@ def unique_reject_dest_pair(dest_dir: Path, img_name: str, sidecar: Path) -> tup
     stem = Path(img_name).stem
     suffix = Path(img_name).suffix
     n = 1
-    while True:
+    while n <= 10_000:
         candidate_name = img_name if n == 1 else f"{stem}_{n}{suffix}"
         img_dest = dest_dir / candidate_name
-        sidecar_dest = dest_dir / _paired_sidecar_name(candidate_name, sidecar, img_name)
+        sidecar_dest = dest_dir / _paired_sidecar_name(candidate_name, sidecar, img_name, n=n)
         if not img_dest.exists() and not sidecar_dest.exists():
             return img_dest, sidecar_dest
         n += 1
+    raise RuntimeError(f"Could not allocate reject destination pair for {img_name}")
 
 
-def _paired_sidecar_name(img_dest_name: str, sidecar: Path, src_img_name: str) -> str:
+def _paired_sidecar_name(img_dest_name: str, sidecar: Path, src_img_name: str, *, n: int = 1) -> str:
     if sidecar.name.startswith(src_img_name):
         return f"{img_dest_name}{sidecar.name[len(src_img_name):]}"
     src_stem = Path(src_img_name).stem
     if sidecar.name.startswith(f"{src_stem}.") and sidecar.name.endswith(".json"):
         dest_stem = Path(img_dest_name).stem
         return f"{dest_stem}{sidecar.name[len(src_stem):]}"
-    return sidecar.name
+    swapped = _bracket_swap_name(src_img_name)
+    if swapped is not None and sidecar.name.startswith(swapped):
+        dest_swapped = _bracket_swap_name(img_dest_name)
+        if dest_swapped is not None:
+            return f"{dest_swapped}{sidecar.name[len(swapped):]}"
+    if n == 1:
+        return sidecar.name
+    if sidecar.name.endswith(".json"):
+        return f"{sidecar.name[:-5]}_{n}.json"
+    return f"{sidecar.name}_{n}"
 
 
 def move_reject(img_path: Path, input_dir: Path, filter_dir: Path, move_lock: threading.Lock | None = None) -> Path:
@@ -1863,6 +1873,14 @@ def _check_takeout_metadata():
         move_reject(img6, input_dir, filter_dir)
         assert (filter_dir / "20030616.jpg").is_file()
         assert (filter_dir / "20030616.json").is_file()
+
+        (filter_dir / "image.jpg(11).json").write_bytes(b"{}")
+        img7 = input_dir / "image(11).jpg"
+        Image.new("RGB", (8, 8), "orange").save(img7, format="JPEG")
+        (input_dir / "image.jpg(11).json").write_text("{}", encoding="utf-8")
+        move_reject(img7, input_dir, filter_dir)
+        assert (filter_dir / "image(11)_2.jpg").is_file()
+        assert (filter_dir / "image.jpg(11)_2.json").is_file()
 
         bad_sidecar = root / "bad.jpg"
         Image.new("RGB", (8, 8), "white").save(bad_sidecar, format="JPEG")
