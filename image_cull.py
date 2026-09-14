@@ -663,13 +663,15 @@ def move_reject(img_path: Path, input_dir: Path, filter_dir: Path, move_lock: th
         rel = resolved_img.relative_to(resolved_input)
         if ".." in rel.parts:
             raise ValueError(f"Invalid path component '..': {rel}")
-        sidecar = find_takeout_sidecar(img_path)
+        sidecar = find_takeout_sidecar(img_path, for_move=True)
+        src_name = img_path.name
         dest_dir = filter_dir / rel.parent
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = unique_reject_path(dest_dir, img_path.name)
         shutil.move(str(img_path), str(dest))
         if sidecar is not None and sidecar.exists():
-            sidecar_dest = unique_reject_path(dest.parent, sidecar.name)
+            sidecar_dest_name = _sidecar_name_for_dest(sidecar, src_name, dest.name)
+            sidecar_dest = unique_reject_path(dest.parent, sidecar_dest_name)
             shutil.move(str(sidecar), str(sidecar_dest))
         return dest
 
@@ -828,6 +830,7 @@ def build_dupe_map(image_paths: list[Path], input_dir: Path) -> dict[str, str]:
 TAKEOUT_SIDECAR_MAX_LEN = 51
 TAKEOUT_EXIF_SUFFIXES = frozenset({".jpg", ".jpeg"})
 _DUP_MARKER_RE = re.compile(r"^(.+)\((\d+)\)(\.[^.]+)$")
+_PROTECTED_JSON_STEMS = frozenset(Path(name).stem for name in (*LEGACY_REPORT_NAMES, DEFAULT_REPORT_NAME))
 
 
 def _fit_takeout_sidecar(base: str) -> str:
@@ -859,22 +862,29 @@ def takeout_sidecar_candidate_names(name: str) -> list[str]:
     return names
 
 
-def _takeout_basename_variants(filename: str) -> list[str]:
-    variants = [filename]
+def _bracket_swap_name(filename: str) -> str | None:
     matches = list(re.finditer(r"\(\d+\)\.", filename))
-    if matches:
-        match = matches[-1]
-        bracket = match.group(0)[:-1]
-        idx = filename.rfind(bracket)
-        if idx >= 0:
-            without = filename[:idx] + filename[idx + len(bracket) :]
-            variants.append(f"{without}{bracket}")
-    stripped = re.sub(r"\(\d+\)\.", ".", filename)
-    if stripped != filename:
-        variants.append(stripped)
+    if not matches:
+        return None
+    match = matches[-1]
+    bracket = match.group(0)[:-1]
+    idx = filename.rfind(bracket)
+    if idx < 0:
+        return None
+    without = filename[:idx] + filename[idx + len(bracket) :]
+    return f"{without}{bracket}"
+
+
+def _takeout_basename_variants(filename: str, *, for_move: bool = False) -> list[str]:
+    variants = [filename]
+    swapped = _bracket_swap_name(filename)
+    if swapped is not None:
+        variants.append(swapped)
+    if for_move:
+        return variants
     stem = Path(filename).stem
     suffix = Path(filename).suffix
-    if suffix:
+    if suffix and stem not in _PROTECTED_JSON_STEMS:
         variants.append(stem)
     seen: set[str] = set()
     ordered: list[str] = []
@@ -885,10 +895,10 @@ def _takeout_basename_variants(filename: str) -> list[str]:
     return ordered
 
 
-def find_takeout_sidecar(img_path: Path) -> Path | None:
+def find_takeout_sidecar(img_path: Path, *, for_move: bool = False) -> Path | None:
     """Locate a Google Takeout JSON sidecar for an image, if present."""
     directory = img_path.parent
-    for variant in _takeout_basename_variants(img_path.name):
+    for variant in _takeout_basename_variants(img_path.name, for_move=for_move):
         for candidate in takeout_sidecar_candidate_names(variant):
             sidecar = directory / candidate
             if sidecar.is_file():
@@ -896,10 +906,21 @@ def find_takeout_sidecar(img_path: Path) -> Path | None:
     return None
 
 
+def _sidecar_name_for_dest(sidecar: Path, src_img_name: str, dest_img_name: str) -> str:
+    if sidecar.name.startswith(src_img_name):
+        return f"{dest_img_name}{sidecar.name[len(src_img_name):]}"
+    return sidecar.name
+
+
 def parse_takeout_sidecar(path: Path) -> dict:
     """Extract creation timestamp and GPS from a Takeout sidecar JSON file."""
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
     result: dict = {}
     for key in ("photoTakenTime", "creationTime"):
         block = data.get(key)
@@ -917,14 +938,20 @@ def parse_takeout_sidecar(path: Path) -> dict:
         lon = geo.get("longitude")
         if lat is None or lon is None:
             continue
-        lat_f, lon_f = float(lat), float(lon)
+        try:
+            lat_f, lon_f = float(lat), float(lon)
+        except (TypeError, ValueError):
+            continue
         if lat_f == 0.0 and lon_f == 0.0:
             continue
         result["latitude"] = lat_f
         result["longitude"] = lon_f
         alt = geo.get("altitude")
         if alt is not None:
-            result["altitude"] = float(alt)
+            try:
+                result["altitude"] = float(alt)
+            except (TypeError, ValueError):
+                pass
         break
     return result
 
@@ -935,77 +962,82 @@ def _deg_to_dms_rational(deg: float) -> tuple[tuple[int, int], tuple[int, int], 
     minutes_float = (deg - d) * 60
     m = int(minutes_float)
     s = round((minutes_float - m) * 60 * 10_000)
+    if s >= 600_000:
+        s -= 600_000
+        m += 1
+    if m == 60:
+        m = 0
+        d += 1
     return (d, 1), (m, 1), (s, 10_000)
-
-
-def _exif_has_datetime(exif_dict: dict) -> bool:
-    exif_ifd = exif_dict.get("Exif") or {}
-    zeroth = exif_dict.get("0th") or {}
-    import piexif
-
-    return bool(
-        exif_ifd.get(piexif.ExifIFD.DateTimeOriginal)
-        or zeroth.get(piexif.ImageIFD.DateTime)
-    )
-
-
-def _exif_has_gps(exif_dict: dict) -> bool:
-    gps_ifd = exif_dict.get("GPS") or {}
-    import piexif
-
-    return bool(gps_ifd.get(piexif.GPSIFD.GPSLatitude) and gps_ifd.get(piexif.GPSIFD.GPSLongitude))
 
 
 def merge_takeout_metadata(img_path: Path, sidecar_path: Path | None = None) -> bool:
     """Write missing DateTimeOriginal/GPS from a Takeout sidecar into JPEG EXIF."""
     if img_path.suffix.lower() not in TAKEOUT_EXIF_SUFFIXES:
         return False
+    try:
+        sidecar = sidecar_path or find_takeout_sidecar(img_path)
+        if sidecar is None:
+            return False
+        meta = parse_takeout_sidecar(sidecar)
+        if not meta:
+            return False
+
+        import piexif
+
+        try:
+            exif_dict = piexif.load(str(img_path))
+        except (piexif.InvalidImageDataError, ValueError, OSError):
+            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+
+        modified = False
+        if "timestamp" in meta:
+            local_tz = datetime.now().astimezone().tzinfo
+            dt_str = datetime.fromtimestamp(meta["timestamp"], tz=local_tz).strftime("%Y:%m:%d %H:%M:%S")
+            zeroth = exif_dict.setdefault("0th", {})
+            exif_ifd = exif_dict.setdefault("Exif", {})
+            if not zeroth.get(piexif.ImageIFD.DateTime):
+                zeroth[piexif.ImageIFD.DateTime] = dt_str
+                modified = True
+            if not exif_ifd.get(piexif.ExifIFD.DateTimeOriginal):
+                exif_ifd[piexif.ExifIFD.DateTimeOriginal] = dt_str
+                modified = True
+            if not exif_ifd.get(piexif.ExifIFD.DateTimeDigitized):
+                exif_ifd[piexif.ExifIFD.DateTimeDigitized] = dt_str
+                modified = True
+
+        if "latitude" in meta and "longitude" in meta:
+            lat, lon = meta["latitude"], meta["longitude"]
+            gps_ifd = exif_dict.setdefault("GPS", {})
+            if not gps_ifd.get(piexif.GPSIFD.GPSLatitude):
+                gps_ifd[piexif.GPSIFD.GPSLatitudeRef] = b"N" if lat >= 0 else b"S"
+                gps_ifd[piexif.GPSIFD.GPSLatitude] = _deg_to_dms_rational(lat)
+                modified = True
+            if not gps_ifd.get(piexif.GPSIFD.GPSLongitude):
+                gps_ifd[piexif.GPSIFD.GPSLongitudeRef] = b"E" if lon >= 0 else b"W"
+                gps_ifd[piexif.GPSIFD.GPSLongitude] = _deg_to_dms_rational(lon)
+                modified = True
+            if "altitude" in meta and not gps_ifd.get(piexif.GPSIFD.GPSAltitude):
+                alt = meta["altitude"]
+                gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = 0 if alt >= 0 else 1
+                gps_ifd[piexif.GPSIFD.GPSAltitude] = (round(abs(alt) * 100), 100)
+                modified = True
+
+        if modified:
+            piexif.insert(piexif.dump(exif_dict), str(img_path))
+        return modified
+    except Exception:  # noqa: BLE001 — per-image metadata merge must not abort the batch
+        return False
+
+
+def remove_takeout_sidecar(img_path: Path, *, sidecar_path: Path | None = None) -> bool:
     sidecar = sidecar_path or find_takeout_sidecar(img_path)
     if sidecar is None:
         return False
-    meta = parse_takeout_sidecar(sidecar)
-    if not meta:
-        return False
-
-    import piexif
-
     try:
-        exif_dict = piexif.load(str(img_path))
-    except (piexif.InvalidImageDataError, ValueError):
-        exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
-
-    modified = False
-    if not _exif_has_datetime(exif_dict) and "timestamp" in meta:
-        dt_str = datetime.fromtimestamp(meta["timestamp"], tz=timezone.utc).strftime("%Y:%m:%d %H:%M:%S")
-        exif_dict.setdefault("0th", {})[piexif.ImageIFD.DateTime] = dt_str
-        exif_ifd = exif_dict.setdefault("Exif", {})
-        exif_ifd[piexif.ExifIFD.DateTimeOriginal] = dt_str
-        exif_ifd[piexif.ExifIFD.DateTimeDigitized] = dt_str
-        modified = True
-
-    if not _exif_has_gps(exif_dict) and "latitude" in meta and "longitude" in meta:
-        lat, lon = meta["latitude"], meta["longitude"]
-        gps_ifd = exif_dict.setdefault("GPS", {})
-        gps_ifd[piexif.GPSIFD.GPSLatitudeRef] = b"N" if lat >= 0 else b"S"
-        gps_ifd[piexif.GPSIFD.GPSLatitude] = _deg_to_dms_rational(lat)
-        gps_ifd[piexif.GPSIFD.GPSLongitudeRef] = b"E" if lon >= 0 else b"W"
-        gps_ifd[piexif.GPSIFD.GPSLongitude] = _deg_to_dms_rational(lon)
-        if "altitude" in meta:
-            alt = meta["altitude"]
-            gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = 0 if alt >= 0 else 1
-            gps_ifd[piexif.GPSIFD.GPSAltitude] = (round(abs(alt) * 100), 100)
-        modified = True
-
-    if modified:
-        piexif.insert(piexif.dump(exif_dict), str(img_path))
-    return modified
-
-
-def remove_takeout_sidecar(img_path: Path) -> bool:
-    sidecar = find_takeout_sidecar(img_path)
-    if sidecar is None:
+        sidecar.unlink()
+    except OSError:
         return False
-    sidecar.unlink()
     return True
 
 
@@ -1117,6 +1149,7 @@ def process_image(
     dupe_of: str | None = None,
     min_res: tuple[int, int] | None = None,
     edit_reject_reason: str | None = None,
+    takeout_merged: bool = False,
 ) -> dict:
     tag = f"{progress.begin()} " if progress else ""
     rel_path = img_path.relative_to(input_dir).as_posix()
@@ -1155,7 +1188,7 @@ def process_image(
                     else:
                         with print_lock:
                             print(f"{tag}  -> Preserved keeper in place")
-                        if not dry_run:
+                        if not dry_run and takeout_merged:
                             remove_takeout_sidecar(img_path)
                 return result
         if "ai" in config.lenses:
@@ -1221,7 +1254,7 @@ def process_image(
         else:
             with print_lock:
                 print(f"{tag}  -> Preserved keeper in place")
-            if not dry_run:
+            if not dry_run and takeout_merged:
                 remove_takeout_sidecar(img_path)
 
     return result
@@ -1406,8 +1439,17 @@ def run_cull(args, input_dir: Path, filter_dir: Path):
         print(f"Warning: --min-res ignored because hygiene lens is not active (lenses: {', '.join(config.lenses)})")
     min_res = args.min_res if "hygiene" in config.lenses else None
 
+    takeout_merged: set[str] = set()
     if not args.dry_run:
-        merged = sum(1 for p in image_paths if merge_takeout_metadata(p))
+        merged = 0
+        for img_path in image_paths:
+            rel = img_path.relative_to(input_dir).as_posix()
+            try:
+                if merge_takeout_metadata(img_path):
+                    takeout_merged.add(rel)
+                    merged += 1
+            except Exception as e:  # noqa: BLE001 — per-image: log and continue batch
+                print(f"Warning: Takeout metadata merge failed for {rel}: {e}")
         if merged:
             print(f"Merged Takeout sidecar metadata into {merged} JPEG(s).")
 
@@ -1436,6 +1478,7 @@ def run_cull(args, input_dir: Path, filter_dir: Path):
             dupe_of=dupe_map.get(img_path.relative_to(input_dir).as_posix()),
             min_res=min_res,
             edit_reject_reason=edit_rejects.get(img_path.relative_to(input_dir).as_posix()),
+            takeout_merged=img_path.relative_to(input_dir).as_posix() in takeout_merged,
         )
 
     with ThreadPoolExecutor(max_workers=depth) as executor:
@@ -1781,10 +1824,25 @@ def _check_takeout_metadata():
         assert (filter_dir / "move_me.jpg.json").is_file()
         assert not sidecar3.exists()
 
+        (filter_dir / "collision.jpg").write_bytes(b"x")
+        img5 = input_dir / "collision.jpg"
+        Image.new("RGB", (8, 8), "cyan").save(img5, format="JPEG")
+        sidecar5 = input_dir / "collision.jpg.json"
+        sidecar5.write_text("{}", encoding="utf-8")
+        move_reject(img5, input_dir, filter_dir)
+        assert (filter_dir / "collision_2.jpg").is_file()
+        assert (filter_dir / "collision_2.jpg.json").is_file()
+
+        bad_sidecar = root / "bad.jpg"
+        Image.new("RGB", (8, 8), "white").save(bad_sidecar, format="JPEG")
+        (root / "bad.jpg.json").write_text("{not json", encoding="utf-8")
+        assert merge_takeout_metadata(bad_sidecar) is False
+
         img4 = input_dir / "keeper.jpg"
         Image.new("RGB", (8, 8), "yellow").save(img4, format="JPEG")
         sidecar4 = input_dir / "keeper.jpg.json"
-        sidecar4.write_text("{}", encoding="utf-8")
+        sidecar4.write_text(json.dumps(sidecar_json), encoding="utf-8")
+        assert merge_takeout_metadata(img4) is True
         assert remove_takeout_sidecar(img4) is True
         assert not sidecar4.exists()
 
