@@ -642,16 +642,60 @@ def should_reject(entry: dict, threshold: float, meta: dict | None = None) -> bo
     return reject
 
 
+_DUP_SUFFIX_RE = re.compile(r"^(.+)(\(\d+\))(\.[^.]+)$")
+
+
+def _reject_collision_name(filename: str, n: int) -> str:
+    if n == 1:
+        return filename
+    m = _DUP_SUFFIX_RE.match(filename)
+    if m:
+        return f"{m.group(1)}_{n}{m.group(2)}{m.group(3)}"
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    return f"{stem}_{n}{suffix}"
+
+
 def unique_reject_path(filter_dir: Path, filename: str) -> Path:
     dest = filter_dir / filename
     if not dest.exists():
         return dest
-    stem = Path(filename).stem
-    suffix = Path(filename).suffix
     n = 2
-    while (candidate := filter_dir / f"{stem}_{n}{suffix}").exists():
+    while (candidate := filter_dir / _reject_collision_name(filename, n)).exists():
         n += 1
     return candidate
+
+
+def unique_reject_dest_pair(dest_dir: Path, img_name: str, sidecar: Path) -> tuple[Path, Path]:
+    """Pick image/sidecar destinations together so both keep a matching basename."""
+    n = 1
+    while n <= 10_000:
+        candidate_name = _reject_collision_name(img_name, n)
+        img_dest = dest_dir / candidate_name
+        sidecar_dest = dest_dir / _paired_sidecar_name(candidate_name, sidecar, img_name, n=n)
+        if not img_dest.exists() and not sidecar_dest.exists():
+            return img_dest, sidecar_dest
+        n += 1
+    raise RuntimeError(f"Could not allocate reject destination pair for {img_name}")
+
+
+def _paired_sidecar_name(img_dest_name: str, sidecar: Path, src_img_name: str, *, n: int = 1) -> str:
+    if sidecar.name.startswith(src_img_name):
+        return f"{img_dest_name}{sidecar.name[len(src_img_name):]}"
+    src_stem = Path(src_img_name).stem
+    if sidecar.name.startswith(f"{src_stem}.") and sidecar.name.endswith(".json"):
+        dest_stem = Path(img_dest_name).stem
+        return f"{dest_stem}{sidecar.name[len(src_stem):]}"
+    swapped = _bracket_swap_name(src_img_name)
+    if swapped is not None and sidecar.name.startswith(swapped):
+        dest_swapped = _bracket_swap_name(img_dest_name)
+        if dest_swapped is not None:
+            return f"{dest_swapped}{sidecar.name[len(swapped):]}"
+    if n == 1:
+        return sidecar.name
+    if sidecar.name.endswith(".json"):
+        return f"{sidecar.name[:-5]}_{n}.json"
+    return f"{sidecar.name}_{n}"
 
 
 def move_reject(img_path: Path, input_dir: Path, filter_dir: Path, move_lock: threading.Lock | None = None) -> Path:
@@ -663,10 +707,17 @@ def move_reject(img_path: Path, input_dir: Path, filter_dir: Path, move_lock: th
         rel = resolved_img.relative_to(resolved_input)
         if ".." in rel.parts:
             raise ValueError(f"Invalid path component '..': {rel}")
+        sidecar = find_takeout_sidecar(img_path)
         dest_dir = filter_dir / rel.parent
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = unique_reject_path(dest_dir, img_path.name)
+        if sidecar is not None and sidecar.exists():
+            dest, sidecar_dest = unique_reject_dest_pair(dest_dir, img_path.name, sidecar)
+        else:
+            dest = unique_reject_path(dest_dir, img_path.name)
+            sidecar_dest = None
         shutil.move(str(img_path), str(dest))
+        if sidecar is not None and sidecar.exists() and sidecar_dest is not None:
+            shutil.move(str(sidecar), str(sidecar_dest))
         return dest
 
     if move_lock is None:
@@ -821,6 +872,211 @@ def build_dupe_map(image_paths: list[Path], input_dir: Path) -> dict[str, str]:
     return dupes
 
 
+TAKEOUT_SIDECAR_MAX_LEN = 51
+TAKEOUT_EXIF_SUFFIXES = frozenset({".jpg", ".jpeg"})
+_DUP_MARKER_RE = re.compile(r"^(.+)\((\d+)\)(\.[^.]+)$")
+_PROTECTED_JSON_STEMS = frozenset(Path(name).stem for name in (*LEGACY_REPORT_NAMES, DEFAULT_REPORT_NAME))
+
+
+def _fit_takeout_sidecar(base: str) -> str:
+    full = f"{base}.json"
+    if len(full) <= TAKEOUT_SIDECAR_MAX_LEN:
+        return full
+    return f"{base[: TAKEOUT_SIDECAR_MAX_LEN - len('.json')]}.json"
+
+
+def takeout_sidecar_candidate_names(name: str) -> list[str]:
+    """Candidate Google Takeout sidecar filenames for a media basename."""
+    names = [
+        _fit_takeout_sidecar(name),
+        _fit_takeout_sidecar(f"{name}.supplemental-metadata"),
+    ]
+    m = _DUP_MARKER_RE.match(name)
+    if m:
+        bare = f"{m.group(1)}{m.group(3)}"
+        num = m.group(2)
+        full_base = f"{bare}.supplemental-metadata"
+        full_with_json = f"{full_base}.json"
+        trunc_base = (
+            full_base
+            if len(full_with_json) <= TAKEOUT_SIDECAR_MAX_LEN
+            else full_base[: TAKEOUT_SIDECAR_MAX_LEN - len(".json")]
+        )
+        names.append(f"{trunc_base}({num}).json")
+        names.append(f"{bare}({num}).json")
+    return names
+
+
+def _bracket_swap_name(filename: str) -> str | None:
+    matches = list(re.finditer(r"\(\d+\)\.", filename))
+    if not matches:
+        return None
+    match = matches[-1]
+    bracket = match.group(0)[:-1]
+    idx = filename.rfind(bracket)
+    if idx < 0:
+        return None
+    without = filename[:idx] + filename[idx + len(bracket) :]
+    return f"{without}{bracket}"
+
+
+def _takeout_basename_variants(filename: str) -> list[str]:
+    variants = [filename]
+    swapped = _bracket_swap_name(filename)
+    if swapped is not None:
+        variants.append(swapped)
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    if suffix and stem not in _PROTECTED_JSON_STEMS:
+        variants.append(stem)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in variants:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+def find_takeout_sidecar(img_path: Path) -> Path | None:
+    """Locate a Google Takeout JSON sidecar for an image, if present."""
+    directory = img_path.parent
+    for variant in _takeout_basename_variants(img_path.name):
+        for candidate in takeout_sidecar_candidate_names(variant):
+            sidecar = directory / candidate
+            if sidecar.is_file():
+                return sidecar
+    return None
+
+
+def parse_takeout_sidecar(path: Path) -> dict:
+    """Extract creation timestamp and GPS from a Takeout sidecar JSON file."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict = {}
+    for key in ("photoTakenTime", "creationTime"):
+        block = data.get(key)
+        if isinstance(block, dict) and block.get("timestamp") is not None:
+            try:
+                result["timestamp"] = int(str(block["timestamp"]))
+                break
+            except ValueError:
+                continue
+    for geo_key in ("geoDataExif", "geoData"):
+        geo = data.get(geo_key)
+        if not isinstance(geo, dict):
+            continue
+        lat = geo.get("latitude")
+        lon = geo.get("longitude")
+        if lat is None or lon is None:
+            continue
+        try:
+            lat_f, lon_f = float(lat), float(lon)
+        except (TypeError, ValueError):
+            continue
+        if lat_f == 0.0 and lon_f == 0.0:
+            continue
+        result["latitude"] = lat_f
+        result["longitude"] = lon_f
+        alt = geo.get("altitude")
+        if alt is not None:
+            try:
+                altitude = float(alt)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if math.isfinite(altitude):
+                    result["altitude"] = altitude
+        break
+    return result
+
+
+def _deg_to_dms_rational(deg: float) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    deg = abs(deg)
+    d = int(deg)
+    minutes_float = (deg - d) * 60
+    m = int(minutes_float)
+    s = round((minutes_float - m) * 60 * 10_000)
+    if s >= 600_000:
+        s -= 600_000
+        m += 1
+    if m == 60:
+        m = 0
+        d += 1
+    return (d, 1), (m, 1), (s, 10_000)
+
+
+def merge_takeout_metadata(img_path: Path, sidecar_path: Path | None = None) -> bool:
+    """Write missing DateTimeOriginal/GPS from a Takeout sidecar into JPEG EXIF."""
+    if img_path.suffix.lower() not in TAKEOUT_EXIF_SUFFIXES:
+        return False
+    sidecar = sidecar_path or find_takeout_sidecar(img_path)
+    if sidecar is None:
+        return False
+    meta = parse_takeout_sidecar(sidecar)
+    if not meta:
+        return False
+
+    import piexif
+
+    try:
+        exif_dict = piexif.load(str(img_path))
+    except (piexif.InvalidImageDataError, ValueError, OSError):
+        return False
+
+    modified = False
+    if "timestamp" in meta:
+        dt_str = datetime.fromtimestamp(meta["timestamp"]).strftime("%Y:%m:%d %H:%M:%S")  # noqa: DTZ006
+        zeroth = exif_dict.setdefault("0th", {})
+        exif_ifd = exif_dict.setdefault("Exif", {})
+        if not zeroth.get(piexif.ImageIFD.DateTime):
+            zeroth[piexif.ImageIFD.DateTime] = dt_str
+            modified = True
+        if not exif_ifd.get(piexif.ExifIFD.DateTimeOriginal):
+            exif_ifd[piexif.ExifIFD.DateTimeOriginal] = dt_str
+            modified = True
+        if not exif_ifd.get(piexif.ExifIFD.DateTimeDigitized):
+            exif_ifd[piexif.ExifIFD.DateTimeDigitized] = dt_str
+            modified = True
+
+    if "latitude" in meta and "longitude" in meta:
+        lat, lon = meta["latitude"], meta["longitude"]
+        gps_ifd = exif_dict.setdefault("GPS", {})
+        if not gps_ifd.get(piexif.GPSIFD.GPSLatitude):
+            gps_ifd[piexif.GPSIFD.GPSLatitudeRef] = b"N" if lat >= 0 else b"S"
+            gps_ifd[piexif.GPSIFD.GPSLatitude] = _deg_to_dms_rational(lat)
+            modified = True
+        if not gps_ifd.get(piexif.GPSIFD.GPSLongitude):
+            gps_ifd[piexif.GPSIFD.GPSLongitudeRef] = b"E" if lon >= 0 else b"W"
+            gps_ifd[piexif.GPSIFD.GPSLongitude] = _deg_to_dms_rational(lon)
+            modified = True
+        if "altitude" in meta and not gps_ifd.get(piexif.GPSIFD.GPSAltitude):
+            alt = meta["altitude"]
+            gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = 0 if alt >= 0 else 1
+            gps_ifd[piexif.GPSIFD.GPSAltitude] = (round(abs(alt) * 100), 100)
+            modified = True
+
+    if modified:
+        piexif.insert(piexif.dump(exif_dict), str(img_path))
+    return modified
+
+
+def remove_takeout_sidecar(img_path: Path, *, sidecar_path: Path | None = None) -> bool:
+    sidecar = sidecar_path or find_takeout_sidecar(img_path)
+    if sidecar is None:
+        return False
+    try:
+        sidecar.unlink()
+    except OSError:
+        return False
+    return True
+
+
 def _is_solid_color(img) -> bool:
     # ponytail: 8x8 downsample; per-channel range <= 2 catches blank/solid renders; upgrade: histogram
     small = img.resize((8, 8))
@@ -929,6 +1185,7 @@ def process_image(
     dupe_of: str | None = None,
     min_res: tuple[int, int] | None = None,
     edit_reject_reason: str | None = None,
+    takeout_merged: bool = False,
 ) -> dict:
     tag = f"{progress.begin()} " if progress else ""
     rel_path = img_path.relative_to(input_dir).as_posix()
@@ -967,6 +1224,8 @@ def process_image(
                     else:
                         with print_lock:
                             print(f"{tag}  -> Preserved keeper in place")
+                        if not dry_run and takeout_merged:
+                            remove_takeout_sidecar(img_path)
                 return result
         if "ai" in config.lenses:
             analysis_dict = analyze_image(img_path, model_name, max_dimension, fast)
@@ -1031,6 +1290,8 @@ def process_image(
         else:
             with print_lock:
                 print(f"{tag}  -> Preserved keeper in place")
+            if not dry_run and takeout_merged:
+                remove_takeout_sidecar(img_path)
 
     return result
 
@@ -1213,6 +1474,21 @@ def run_cull(args, input_dir: Path, filter_dir: Path):
     if args.min_res is not None and "hygiene" not in config.lenses:
         print(f"Warning: --min-res ignored because hygiene lens is not active (lenses: {', '.join(config.lenses)})")
     min_res = args.min_res if "hygiene" in config.lenses else None
+
+    takeout_merged: set[str] = set()
+    if not args.dry_run:
+        merged = 0
+        for img_path in image_paths:
+            rel = img_path.relative_to(input_dir).as_posix()
+            try:
+                if merge_takeout_metadata(img_path):
+                    takeout_merged.add(rel)
+                    merged += 1
+            except Exception as e:  # noqa: BLE001 — per-image: log and continue batch
+                print(f"Warning: Takeout metadata merge failed for {rel}: {e}")
+        if merged:
+            print(f"Merged Takeout sidecar metadata into {merged} JPEG(s).")
+
     depth = pipeline_depth(len(image_paths))
     print_lock = threading.Lock()
     move_lock = threading.Lock()
@@ -1238,6 +1514,7 @@ def run_cull(args, input_dir: Path, filter_dir: Path):
             dupe_of=dupe_map.get(img_path.relative_to(input_dir).as_posix()),
             min_res=min_res,
             edit_reject_reason=edit_rejects.get(img_path.relative_to(input_dir).as_posix()),
+            takeout_merged=img_path.relative_to(input_dir).as_posix() in takeout_merged,
         )
 
     with ThreadPoolExecutor(max_workers=depth) as executor:
@@ -1520,6 +1797,118 @@ def _self_check():
     _check_quality_fast_issue_validation()
     _check_heif_support()
     _check_edit_policy()
+    _check_takeout_metadata()
+
+
+def _check_takeout_metadata():
+    import piexif
+    from PIL import Image
+
+    sidecar_json = {
+        "photoTakenTime": {"timestamp": "1453591193"},
+        "geoDataExif": {"latitude": 40.7855556, "longitude": -73.9766667, "altitude": 44.0},
+    }
+    long_name = "A" * 40 + ".jpg"
+    assert takeout_sidecar_candidate_names(long_name) == [
+        _fit_takeout_sidecar(long_name),
+        _fit_takeout_sidecar(f"{long_name}.supplemental-metadata"),
+    ]
+    truncated = takeout_sidecar_candidate_names("Screenshot_20231027_123303_Facebook.jpg")[1]
+    assert truncated.endswith(".json") and len(truncated) == TAKEOUT_SIDECAR_MAX_LEN
+
+    dup_names = takeout_sidecar_candidate_names("photo(3).jpg")
+    assert "photo.jpg.supplemental-metadata(3).json" in dup_names
+    assert "photo.jpg(3).json" in dup_names
+
+    bracket = _takeout_basename_variants("image(11).jpg")
+    assert "image.jpg(11)" in bracket
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        img_path = root / "20030616.jpg"
+        Image.new("RGB", (8, 8), "red").save(img_path, format="JPEG")
+        (root / "20030616.json").write_text(json.dumps(sidecar_json), encoding="utf-8")
+        assert find_takeout_sidecar(img_path) == root / "20030616.json"
+
+        img_path = root / "photo.jpg"
+        Image.new("RGB", (8, 8), "red").save(img_path, format="JPEG")
+        (root / "photo.jpg.supplemental-metadata.json").write_text(json.dumps(sidecar_json), encoding="utf-8")
+        assert find_takeout_sidecar(img_path) == root / "photo.jpg.supplemental-metadata.json"
+        assert merge_takeout_metadata(img_path) is True
+        exif = piexif.load(str(img_path))
+        expected_dt = datetime.fromtimestamp(1453591193).strftime("%Y:%m:%d %H:%M:%S").encode()  # noqa: DTZ006
+        assert exif["Exif"][piexif.ExifIFD.DateTimeOriginal] == expected_dt
+        assert piexif.GPSIFD.GPSLatitude in exif["GPS"]
+
+        img2_path = root / "has_gps.jpg"
+        Image.new("RGB", (8, 8), "blue").save(img2_path, format="JPEG")
+        existing = piexif.load(str(img2_path))
+        existing.setdefault("GPS", {})
+        existing["GPS"][piexif.GPSIFD.GPSLatitudeRef] = b"N"
+        existing["GPS"][piexif.GPSIFD.GPSLatitude] = ((1, 1), (0, 1), (0, 1))
+        existing["GPS"][piexif.GPSIFD.GPSLongitudeRef] = b"W"
+        existing["GPS"][piexif.GPSIFD.GPSLongitude] = ((1, 1), (0, 1), (0, 1))
+        piexif.insert(piexif.dump(existing), str(img2_path))
+        (root / "has_gps.jpg.json").write_text(json.dumps(sidecar_json), encoding="utf-8")
+        assert merge_takeout_metadata(img2_path) is True
+        exif2 = piexif.load(str(img2_path))
+        assert exif2["Exif"][piexif.ExifIFD.DateTimeOriginal] == expected_dt
+        assert exif2["GPS"][piexif.GPSIFD.GPSLatitude] == existing["GPS"][piexif.GPSIFD.GPSLatitude]
+
+        input_dir = root / "in"
+        filter_dir = root / "out"
+        input_dir.mkdir()
+        filter_dir.mkdir()
+        img3 = input_dir / "move_me.jpg"
+        Image.new("RGB", (8, 8), "green").save(img3, format="JPEG")
+        sidecar3 = input_dir / "move_me.jpg.json"
+        sidecar3.write_text("{}", encoding="utf-8")
+        move_reject(img3, input_dir, filter_dir)
+        assert (filter_dir / "move_me.jpg").is_file()
+        assert (filter_dir / "move_me.jpg.json").is_file()
+        assert not sidecar3.exists()
+
+        (filter_dir / "collision.jpg").write_bytes(b"x")
+        (filter_dir / "collision_2.jpg.json").write_bytes(b"{}")
+        img5 = input_dir / "collision.jpg"
+        Image.new("RGB", (8, 8), "cyan").save(img5, format="JPEG")
+        sidecar5 = input_dir / "collision.jpg.json"
+        sidecar5.write_text("{}", encoding="utf-8")
+        move_reject(img5, input_dir, filter_dir)
+        assert (filter_dir / "collision_3.jpg").is_file()
+        assert (filter_dir / "collision_3.jpg.json").is_file()
+
+        img6 = input_dir / "20030616.jpg"
+        Image.new("RGB", (8, 8), "magenta").save(img6, format="JPEG")
+        sidecar6 = input_dir / "20030616.json"
+        sidecar6.write_text("{}", encoding="utf-8")
+        move_reject(img6, input_dir, filter_dir)
+        assert (filter_dir / "20030616.jpg").is_file()
+        assert (filter_dir / "20030616.json").is_file()
+
+        (filter_dir / "image.jpg(11).json").write_bytes(b"{}")
+        img7 = input_dir / "image(11).jpg"
+        Image.new("RGB", (8, 8), "orange").save(img7, format="JPEG")
+        (input_dir / "image.jpg(11).json").write_text("{}", encoding="utf-8")
+        move_reject(img7, input_dir, filter_dir)
+        moved_img = filter_dir / "image_2(11).jpg"
+        moved_sidecar = filter_dir / "image_2.jpg(11).json"
+        assert moved_img.is_file()
+        assert moved_sidecar.is_file()
+        assert find_takeout_sidecar(moved_img) == moved_sidecar
+
+        bad_sidecar = root / "bad.jpg"
+        Image.new("RGB", (8, 8), "white").save(bad_sidecar, format="JPEG")
+        (root / "bad.jpg.json").write_text("{not json", encoding="utf-8")
+        assert merge_takeout_metadata(bad_sidecar) is False
+
+        img4 = input_dir / "keeper.jpg"
+        Image.new("RGB", (8, 8), "yellow").save(img4, format="JPEG")
+        sidecar4 = input_dir / "keeper.jpg.json"
+        sidecar4.write_text(json.dumps(sidecar_json), encoding="utf-8")
+        assert merge_takeout_metadata(img4) is True
+        assert remove_takeout_sidecar(img4) is True
+        assert not sidecar4.exists()
 
 
 def _hygiene_fixtures_dir() -> Path:
