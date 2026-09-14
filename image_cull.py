@@ -949,9 +949,12 @@ def parse_takeout_sidecar(path: Path) -> dict:
         alt = geo.get("altitude")
         if alt is not None:
             try:
-                result["altitude"] = float(alt)
+                altitude = float(alt)
             except (TypeError, ValueError):
                 pass
+            else:
+                if math.isfinite(altitude):
+                    result["altitude"] = altitude
         break
     return result
 
@@ -975,59 +978,56 @@ def merge_takeout_metadata(img_path: Path, sidecar_path: Path | None = None) -> 
     """Write missing DateTimeOriginal/GPS from a Takeout sidecar into JPEG EXIF."""
     if img_path.suffix.lower() not in TAKEOUT_EXIF_SUFFIXES:
         return False
-    try:
-        sidecar = sidecar_path or find_takeout_sidecar(img_path)
-        if sidecar is None:
-            return False
-        meta = parse_takeout_sidecar(sidecar)
-        if not meta:
-            return False
-
-        import piexif
-
-        try:
-            exif_dict = piexif.load(str(img_path))
-        except (piexif.InvalidImageDataError, ValueError, OSError):
-            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
-
-        modified = False
-        if "timestamp" in meta:
-            local_tz = datetime.now().astimezone().tzinfo
-            dt_str = datetime.fromtimestamp(meta["timestamp"], tz=local_tz).strftime("%Y:%m:%d %H:%M:%S")
-            zeroth = exif_dict.setdefault("0th", {})
-            exif_ifd = exif_dict.setdefault("Exif", {})
-            if not zeroth.get(piexif.ImageIFD.DateTime):
-                zeroth[piexif.ImageIFD.DateTime] = dt_str
-                modified = True
-            if not exif_ifd.get(piexif.ExifIFD.DateTimeOriginal):
-                exif_ifd[piexif.ExifIFD.DateTimeOriginal] = dt_str
-                modified = True
-            if not exif_ifd.get(piexif.ExifIFD.DateTimeDigitized):
-                exif_ifd[piexif.ExifIFD.DateTimeDigitized] = dt_str
-                modified = True
-
-        if "latitude" in meta and "longitude" in meta:
-            lat, lon = meta["latitude"], meta["longitude"]
-            gps_ifd = exif_dict.setdefault("GPS", {})
-            if not gps_ifd.get(piexif.GPSIFD.GPSLatitude):
-                gps_ifd[piexif.GPSIFD.GPSLatitudeRef] = b"N" if lat >= 0 else b"S"
-                gps_ifd[piexif.GPSIFD.GPSLatitude] = _deg_to_dms_rational(lat)
-                modified = True
-            if not gps_ifd.get(piexif.GPSIFD.GPSLongitude):
-                gps_ifd[piexif.GPSIFD.GPSLongitudeRef] = b"E" if lon >= 0 else b"W"
-                gps_ifd[piexif.GPSIFD.GPSLongitude] = _deg_to_dms_rational(lon)
-                modified = True
-            if "altitude" in meta and not gps_ifd.get(piexif.GPSIFD.GPSAltitude):
-                alt = meta["altitude"]
-                gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = 0 if alt >= 0 else 1
-                gps_ifd[piexif.GPSIFD.GPSAltitude] = (round(abs(alt) * 100), 100)
-                modified = True
-
-        if modified:
-            piexif.insert(piexif.dump(exif_dict), str(img_path))
-        return modified
-    except Exception:  # noqa: BLE001 — per-image metadata merge must not abort the batch
+    sidecar = sidecar_path or find_takeout_sidecar(img_path)
+    if sidecar is None:
         return False
+    meta = parse_takeout_sidecar(sidecar)
+    if not meta:
+        return False
+
+    import piexif
+
+    try:
+        exif_dict = piexif.load(str(img_path))
+    except (piexif.InvalidImageDataError, ValueError, OSError):
+        return False
+
+    modified = False
+    if "timestamp" in meta:
+        local_tz = datetime.now().astimezone().tzinfo
+        dt_str = datetime.fromtimestamp(meta["timestamp"], tz=local_tz).strftime("%Y:%m:%d %H:%M:%S")
+        zeroth = exif_dict.setdefault("0th", {})
+        exif_ifd = exif_dict.setdefault("Exif", {})
+        if not zeroth.get(piexif.ImageIFD.DateTime):
+            zeroth[piexif.ImageIFD.DateTime] = dt_str
+            modified = True
+        if not exif_ifd.get(piexif.ExifIFD.DateTimeOriginal):
+            exif_ifd[piexif.ExifIFD.DateTimeOriginal] = dt_str
+            modified = True
+        if not exif_ifd.get(piexif.ExifIFD.DateTimeDigitized):
+            exif_ifd[piexif.ExifIFD.DateTimeDigitized] = dt_str
+            modified = True
+
+    if "latitude" in meta and "longitude" in meta:
+        lat, lon = meta["latitude"], meta["longitude"]
+        gps_ifd = exif_dict.setdefault("GPS", {})
+        if not gps_ifd.get(piexif.GPSIFD.GPSLatitude):
+            gps_ifd[piexif.GPSIFD.GPSLatitudeRef] = b"N" if lat >= 0 else b"S"
+            gps_ifd[piexif.GPSIFD.GPSLatitude] = _deg_to_dms_rational(lat)
+            modified = True
+        if not gps_ifd.get(piexif.GPSIFD.GPSLongitude):
+            gps_ifd[piexif.GPSIFD.GPSLongitudeRef] = b"E" if lon >= 0 else b"W"
+            gps_ifd[piexif.GPSIFD.GPSLongitude] = _deg_to_dms_rational(lon)
+            modified = True
+        if "altitude" in meta and not gps_ifd.get(piexif.GPSIFD.GPSAltitude):
+            alt = meta["altitude"]
+            gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = 0 if alt >= 0 else 1
+            gps_ifd[piexif.GPSIFD.GPSAltitude] = (round(abs(alt) * 100), 100)
+            modified = True
+
+    if modified:
+        piexif.insert(piexif.dump(exif_dict), str(img_path))
+    return modified
 
 
 def remove_takeout_sidecar(img_path: Path, *, sidecar_path: Path | None = None) -> bool:
