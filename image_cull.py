@@ -663,7 +663,7 @@ def move_reject(img_path: Path, input_dir: Path, filter_dir: Path, move_lock: th
         rel = resolved_img.relative_to(resolved_input)
         if ".." in rel.parts:
             raise ValueError(f"Invalid path component '..': {rel}")
-        sidecar = find_takeout_sidecar(img_path, for_move=True)
+        sidecar = find_takeout_sidecar(img_path)
         src_name = img_path.name
         dest_dir = filter_dir / rel.parent
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -875,13 +875,11 @@ def _bracket_swap_name(filename: str) -> str | None:
     return f"{without}{bracket}"
 
 
-def _takeout_basename_variants(filename: str, *, for_move: bool = False) -> list[str]:
+def _takeout_basename_variants(filename: str) -> list[str]:
     variants = [filename]
     swapped = _bracket_swap_name(filename)
     if swapped is not None:
         variants.append(swapped)
-    if for_move:
-        return variants
     stem = Path(filename).stem
     suffix = Path(filename).suffix
     if suffix and stem not in _PROTECTED_JSON_STEMS:
@@ -895,10 +893,10 @@ def _takeout_basename_variants(filename: str, *, for_move: bool = False) -> list
     return ordered
 
 
-def find_takeout_sidecar(img_path: Path, *, for_move: bool = False) -> Path | None:
+def find_takeout_sidecar(img_path: Path) -> Path | None:
     """Locate a Google Takeout JSON sidecar for an image, if present."""
     directory = img_path.parent
-    for variant in _takeout_basename_variants(img_path.name, for_move=for_move):
+    for variant in _takeout_basename_variants(img_path.name):
         for candidate in takeout_sidecar_candidate_names(variant):
             sidecar = directory / candidate
             if sidecar.is_file():
@@ -1786,6 +1784,11 @@ def _check_takeout_metadata():
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
+        img_path = root / "20030616.jpg"
+        Image.new("RGB", (8, 8), "red").save(img_path, format="JPEG")
+        (root / "20030616.json").write_text(json.dumps(sidecar_json), encoding="utf-8")
+        assert find_takeout_sidecar(img_path) == root / "20030616.json"
+
         img_path = root / "photo.jpg"
         Image.new("RGB", (8, 8), "red").save(img_path, format="JPEG")
         (root / "photo.jpg.supplemental-metadata.json").write_text(json.dumps(sidecar_json), encoding="utf-8")
@@ -1832,6 +1835,14 @@ def _check_takeout_metadata():
         move_reject(img5, input_dir, filter_dir)
         assert (filter_dir / "collision_2.jpg").is_file()
         assert (filter_dir / "collision_2.jpg.json").is_file()
+
+        img6 = input_dir / "20030616.jpg"
+        Image.new("RGB", (8, 8), "magenta").save(img6, format="JPEG")
+        sidecar6 = input_dir / "20030616.json"
+        sidecar6.write_text("{}", encoding="utf-8")
+        move_reject(img6, input_dir, filter_dir)
+        assert (filter_dir / "20030616.jpg").is_file()
+        assert (filter_dir / "20030616.json").is_file()
 
         bad_sidecar = root / "bad.jpg"
         Image.new("RGB", (8, 8), "white").save(bad_sidecar, format="JPEG")
