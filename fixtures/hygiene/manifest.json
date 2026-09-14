@@ -1,0 +1,69 @@
+{
+  "_note": "files: per-file check_hygiene() with explicit dupe_of. dupe_map and dry_run: build_dupe_map() keeps the first path by sorted name (dupe.jpg before keeper.jpg), so keeper.jpg is the duplicate in a full scan.",
+  "min_res": [512, 512],
+  "dupe_map": {
+    "keeper.jpg": "dupe.jpg"
+  },
+  "files": {
+    "keeper.jpg": {
+      "action": "keep",
+      "dupe_of": null,
+      "_note": "isolated check only; see dupe_map for full-scan survivor"
+    },
+    "dupe.jpg": {
+      "action": "reject",
+      "exact_dupe_of": "keeper.jpg",
+      "dupe_of": "keeper.jpg",
+      "_note": "isolated check with explicit dupe_of; full scan keeps this file as survivor"
+    },
+    "tiny.jpg": {
+      "action": "reject",
+      "reason_prefix": "below_min_res"
+    },
+    "corrupt.jpg": {
+      "action": "reject",
+      "reason": "corrupt"
+    },
+    "solid.png": {
+      "action": "reject",
+      "reason": "solid_color"
+    },
+    "sample.heic": {
+      "action": "keep",
+      "dupe_of": null,
+      "apply_min_res": false,
+      "transcode": true
+    }
+  },
+  "dry_run": {
+    "profile": "mixed",
+    "checks": ["hygiene"],
+    "min_res": "512x512",
+    "expectations": {
+      "corrupt.jpg": {
+        "action": "reject",
+        "reason": "corrupt"
+      },
+      "dupe.jpg": {
+        "action": "keep"
+      },
+      "keeper.jpg": {
+        "action": "reject",
+        "exact_dupe_of": "dupe.jpg",
+        "_note": "full-scan duplicate; survivor is dupe.jpg per top-level dupe_map"
+      },
+      "sample.heic": {
+        "action": "reject",
+        "reason_prefix": "below_min_res"
+      },
+      "solid.png": {
+        "action": "reject",
+        "reason": "solid_color"
+      },
+      "tiny.jpg": {
+        "action": "reject",
+        "reason_prefix": "below_min_res"
+      }
+    }
+  }
+}

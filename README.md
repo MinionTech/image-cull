@@ -363,6 +363,8 @@ shellcheck setup.sh check.sh
 docker build -t image-cull:local . && docker run --rm image-cull:local --self-check
 ```
 
+`--self-check` includes committed hygiene fixtures under `fixtures/hygiene/` (see `manifest.json` for expected `check_hygiene()` outcomes and a hygiene-only dry-run). No Ollama required.
+
 The `Results` job in `.github/workflows/ci.yml` is the intended single required status check on `main`.
 
 ---

@@ -12,6 +12,7 @@ COPY --chown=appuser:appuser requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=appuser:appuser image_cull.py .
+COPY --chown=appuser:appuser fixtures/ fixtures/
 
 USER appuser
 
