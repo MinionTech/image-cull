@@ -994,8 +994,7 @@ def merge_takeout_metadata(img_path: Path, sidecar_path: Path | None = None) -> 
 
     modified = False
     if "timestamp" in meta:
-        local_tz = datetime.now().astimezone().tzinfo
-        dt_str = datetime.fromtimestamp(meta["timestamp"], tz=local_tz).strftime("%Y:%m:%d %H:%M:%S")
+        dt_str = datetime.fromtimestamp(meta["timestamp"]).strftime("%Y:%m:%d %H:%M:%S")  # noqa: DTZ006
         zeroth = exif_dict.setdefault("0th", {})
         exif_ifd = exif_dict.setdefault("Exif", {})
         if not zeroth.get(piexif.ImageIFD.DateTime):
@@ -1793,7 +1792,8 @@ def _check_takeout_metadata():
         assert find_takeout_sidecar(img_path) == root / "photo.jpg.supplemental-metadata.json"
         assert merge_takeout_metadata(img_path) is True
         exif = piexif.load(str(img_path))
-        assert exif["Exif"][piexif.ExifIFD.DateTimeOriginal] == b"2016:01:23 23:19:53"
+        expected_dt = datetime.fromtimestamp(1453591193).strftime("%Y:%m:%d %H:%M:%S").encode()  # noqa: DTZ006
+        assert exif["Exif"][piexif.ExifIFD.DateTimeOriginal] == expected_dt
         assert piexif.GPSIFD.GPSLatitude in exif["GPS"]
 
         img2_path = root / "has_gps.jpg"
@@ -1808,7 +1808,7 @@ def _check_takeout_metadata():
         (root / "has_gps.jpg.json").write_text(json.dumps(sidecar_json), encoding="utf-8")
         assert merge_takeout_metadata(img2_path) is True
         exif2 = piexif.load(str(img2_path))
-        assert exif2["Exif"][piexif.ExifIFD.DateTimeOriginal] == b"2016:01:23 23:19:53"
+        assert exif2["Exif"][piexif.ExifIFD.DateTimeOriginal] == expected_dt
         assert exif2["GPS"][piexif.GPSIFD.GPSLatitude] == existing["GPS"][piexif.GPSIFD.GPSLatitude]
 
         input_dir = root / "in"
