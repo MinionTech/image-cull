@@ -36,7 +36,7 @@ ensure_python() {
   # prepend .venv/bin to PATH — that shadows a good interpreter with an
   # empty one after ensure_ruff installs only ruff.
   has_deps() {
-    [[ -x "$1" ]] && "$1" -c "import ollama, pydantic, PIL, pillow_heif" >/dev/null 2>&1
+    [[ -x "$1" ]] && "$1" -c "import ollama, pydantic, PIL, pillow_heif, piexif" >/dev/null 2>&1
   }
 
   if has_deps "${ROOT}/.venv/bin/python"; then
@@ -46,7 +46,7 @@ ensure_python() {
   elif command -v python3 >/dev/null 2>&1 && has_deps "$(command -v python3)"; then
     PYTHON="$(command -v python3)"
   else
-    echo "error: no Python with app deps (ollama, pydantic, pillow, pillow-heif)" >&2
+    echo "error: no Python with app deps (ollama, pydantic, pillow, pillow-heif, piexif)" >&2
     echo "hint: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
     exit 1
   fi

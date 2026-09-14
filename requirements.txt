@@ -1,4 +1,5 @@
 ollama
+piexif>=1.1.3,<2
 pillow>=11.1.0,<13
 pillow-heif>=0.21.0,<2
 pydantic
