@@ -654,6 +654,30 @@ def unique_reject_path(filter_dir: Path, filename: str) -> Path:
     return candidate
 
 
+def unique_reject_dest_pair(dest_dir: Path, img_name: str, sidecar: Path) -> tuple[Path, Path]:
+    """Pick image/sidecar destinations together so both keep a matching basename."""
+    stem = Path(img_name).stem
+    suffix = Path(img_name).suffix
+    n = 1
+    while True:
+        candidate_name = img_name if n == 1 else f"{stem}_{n}{suffix}"
+        img_dest = dest_dir / candidate_name
+        sidecar_dest = dest_dir / _paired_sidecar_name(candidate_name, sidecar, img_name)
+        if not img_dest.exists() and not sidecar_dest.exists():
+            return img_dest, sidecar_dest
+        n += 1
+
+
+def _paired_sidecar_name(img_dest_name: str, sidecar: Path, src_img_name: str) -> str:
+    if sidecar.name.startswith(src_img_name):
+        return f"{img_dest_name}{sidecar.name[len(src_img_name):]}"
+    src_stem = Path(src_img_name).stem
+    if sidecar.name.startswith(f"{src_stem}.") and sidecar.name.endswith(".json"):
+        dest_stem = Path(img_dest_name).stem
+        return f"{dest_stem}{sidecar.name[len(src_stem):]}"
+    return sidecar.name
+
+
 def move_reject(img_path: Path, input_dir: Path, filter_dir: Path, move_lock: threading.Lock | None = None) -> Path:
     def _move() -> Path:
         resolved_img = img_path.resolve()
@@ -664,14 +688,15 @@ def move_reject(img_path: Path, input_dir: Path, filter_dir: Path, move_lock: th
         if ".." in rel.parts:
             raise ValueError(f"Invalid path component '..': {rel}")
         sidecar = find_takeout_sidecar(img_path)
-        src_name = img_path.name
         dest_dir = filter_dir / rel.parent
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = unique_reject_path(dest_dir, img_path.name)
-        shutil.move(str(img_path), str(dest))
         if sidecar is not None and sidecar.exists():
-            sidecar_dest_name = _sidecar_name_for_dest(sidecar, src_name, dest.name)
-            sidecar_dest = unique_reject_path(dest.parent, sidecar_dest_name)
+            dest, sidecar_dest = unique_reject_dest_pair(dest_dir, img_path.name, sidecar)
+        else:
+            dest = unique_reject_path(dest_dir, img_path.name)
+            sidecar_dest = None
+        shutil.move(str(img_path), str(dest))
+        if sidecar is not None and sidecar.exists() and sidecar_dest is not None:
             shutil.move(str(sidecar), str(sidecar_dest))
         return dest
 
@@ -902,12 +927,6 @@ def find_takeout_sidecar(img_path: Path) -> Path | None:
             if sidecar.is_file():
                 return sidecar
     return None
-
-
-def _sidecar_name_for_dest(sidecar: Path, src_img_name: str, dest_img_name: str) -> str:
-    if sidecar.name.startswith(src_img_name):
-        return f"{dest_img_name}{sidecar.name[len(src_img_name):]}"
-    return sidecar.name
 
 
 def parse_takeout_sidecar(path: Path) -> dict:
@@ -1828,13 +1847,14 @@ def _check_takeout_metadata():
         assert not sidecar3.exists()
 
         (filter_dir / "collision.jpg").write_bytes(b"x")
+        (filter_dir / "collision_2.jpg.json").write_bytes(b"{}")
         img5 = input_dir / "collision.jpg"
         Image.new("RGB", (8, 8), "cyan").save(img5, format="JPEG")
         sidecar5 = input_dir / "collision.jpg.json"
         sidecar5.write_text("{}", encoding="utf-8")
         move_reject(img5, input_dir, filter_dir)
-        assert (filter_dir / "collision_2.jpg").is_file()
-        assert (filter_dir / "collision_2.jpg.json").is_file()
+        assert (filter_dir / "collision_3.jpg").is_file()
+        assert (filter_dir / "collision_3.jpg.json").is_file()
 
         img6 = input_dir / "20030616.jpg"
         Image.new("RGB", (8, 8), "magenta").save(img6, format="JPEG")
