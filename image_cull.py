@@ -642,25 +642,35 @@ def should_reject(entry: dict, threshold: float, meta: dict | None = None) -> bo
     return reject
 
 
+_DUP_SUFFIX_RE = re.compile(r"^(.+)(\(\d+\))(\.[^.]+)$")
+
+
+def _reject_collision_name(filename: str, n: int) -> str:
+    if n == 1:
+        return filename
+    m = _DUP_SUFFIX_RE.match(filename)
+    if m:
+        return f"{m.group(1)}_{n}{m.group(2)}{m.group(3)}"
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    return f"{stem}_{n}{suffix}"
+
+
 def unique_reject_path(filter_dir: Path, filename: str) -> Path:
     dest = filter_dir / filename
     if not dest.exists():
         return dest
-    stem = Path(filename).stem
-    suffix = Path(filename).suffix
     n = 2
-    while (candidate := filter_dir / f"{stem}_{n}{suffix}").exists():
+    while (candidate := filter_dir / _reject_collision_name(filename, n)).exists():
         n += 1
     return candidate
 
 
 def unique_reject_dest_pair(dest_dir: Path, img_name: str, sidecar: Path) -> tuple[Path, Path]:
     """Pick image/sidecar destinations together so both keep a matching basename."""
-    stem = Path(img_name).stem
-    suffix = Path(img_name).suffix
     n = 1
     while n <= 10_000:
-        candidate_name = img_name if n == 1 else f"{stem}_{n}{suffix}"
+        candidate_name = _reject_collision_name(img_name, n)
         img_dest = dest_dir / candidate_name
         sidecar_dest = dest_dir / _paired_sidecar_name(candidate_name, sidecar, img_name, n=n)
         if not img_dest.exists() and not sidecar_dest.exists():
@@ -1879,8 +1889,11 @@ def _check_takeout_metadata():
         Image.new("RGB", (8, 8), "orange").save(img7, format="JPEG")
         (input_dir / "image.jpg(11).json").write_text("{}", encoding="utf-8")
         move_reject(img7, input_dir, filter_dir)
-        assert (filter_dir / "image(11)_2.jpg").is_file()
-        assert (filter_dir / "image.jpg(11)_2.json").is_file()
+        moved_img = filter_dir / "image_2(11).jpg"
+        moved_sidecar = filter_dir / "image_2.jpg(11).json"
+        assert moved_img.is_file()
+        assert moved_sidecar.is_file()
+        assert find_takeout_sidecar(moved_img) == moved_sidecar
 
         bad_sidecar = root / "bad.jpg"
         Image.new("RGB", (8, 8), "white").save(bad_sidecar, format="JPEG")
